@@ -1,0 +1,41 @@
+# Training parameters
+training:
+  market: "DJIA"  # Market name
+  window_size: 13  # Input window size (weeks)
+  batch_size: 32
+  learning_rate: 0.0001
+  gamma: 0.99  # Discount factor
+  epochs: 100
+  save_interval: 10
+  tensorboard_log: true
+  random_seed: 42
+
+# Model parameters
+model:
+  use_market_unit: true  # Whether to use market scoring unit
+  use_spatial_attention: true  # Whether to use spatial attention in asset unit
+  use_gcn: true  # Whether to use graph convolutional network
+  use_adaptive_adj: true  # Whether to use adaptive adjacency matrix
+  relation_file: "relation_matrix.npy"  # Relationship matrix for GCN
+  
+  # Asset scoring unit (ASU)
+  asu:
+    hidden_dim: 64
+    num_layers: 2
+    dropout: 0.1
+    
+  # Market scoring unit (MSU)
+  msu:
+    hidden_dim: 64
+    num_layers: 2
+    dropout: 0.1
+    
+  # Portfolio allocation
+  portfolio:
+    num_assets_select: 4  # Number of assets to select for long/short positions
+
+# Environment parameters
+environment:
+  initial_balance: 10000
+  transaction_fee: 0.001
+  reward_type: "sharpe"  # Options: "sharpe", "sortino", "max_drawdown", "return" 
