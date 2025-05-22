@@ -1,0 +1,25 @@
+{
+    "model": {
+        "hidden_dim": 64,
+        "window_size": 13,
+        "use_spatial_attention": true,
+        "use_gcn": true,
+        "use_adaptive_adj": true,
+        "num_assets_select": 4
+    },
+    "backtest": {
+        "initial_balance": 10000,
+        "transaction_fee": 0.001,
+        "holding_period": 5
+    },
+    "training": {
+        "batch_size": 64,
+        "learning_rate": 0.0001,
+        "weight_decay": 0.00001,
+        "num_epochs": 100,
+        "val_ratio": 0.2
+    },
+    "data": {
+        "stock_features": ["momentum", "upper_volatility", "lower_volatility", "volume"]
+    }
+} 

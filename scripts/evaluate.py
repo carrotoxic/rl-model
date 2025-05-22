@@ -2,293 +2,338 @@ import os
 import sys
 import numpy as np
 import torch
-import yaml
+import json
 import argparse
-from tqdm import tqdm
+from datetime import datetime
 import matplotlib.pyplot as plt
+import pandas as pd
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from models.portfolio_manager import PortfolioManager
 from environments.trading_env import TradingEnvironment
-from agents.deep_trader_agent import DeepTraderAgent
-from utils.data_loader import DataLoader
-from utils.metrics import (
-    evaluate_portfolio,
-    print_performance_report,
-    plot_portfolio_performance,
-    plot_drawdowns
-)
 
 
 def parse_args():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Evaluate a trained DeepTrader model')
-    parser.add_argument('--model_path', type=str, required=True,
-                        help='Path to trained model checkpoint')
-    parser.add_argument('--config', type=str, default='configs/default_config.yaml',
-                        help='Path to config file')
-    parser.add_argument('--output_dir', type=str, default=None,
-                        help='Directory to save outputs (default: determined from model path)')
-    parser.add_argument('--device', type=str, default=None,
-                        help='Device to use (overrides detection)')
-    parser.add_argument('--data_split', type=str, default='test',
-                        choices=['train', 'val', 'test'],
-                        help='Data split to evaluate on')
-    parser.add_argument('--plot', action='store_true',
-                        help='Generate and show performance plots')
-    parser.add_argument('--save_weights', action='store_true',
-                        help='Save portfolio weights over time')
+    parser = argparse.ArgumentParser(description='Evaluate the Portfolio Manager model')
+    parser.add_argument('--config', type=str, required=True, help='Path to config file')
+    parser.add_argument('--data_dir', type=str, required=True, help='Path to data directory')
+    parser.add_argument('--model_path', type=str, required=True, help='Path to model weights')
+    parser.add_argument('--output_dir', type=str, default=None, help='Path to output directory')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--device', type=str, default=None, help='Device to use (cpu/cuda)')
     return parser.parse_args()
 
 
-def main():
-    """Main evaluation script."""
-    args = parse_args()
+def evaluate_portfolio_performance(portfolio_values, initial_value=10000):
+    """
+    Calculate performance metrics for a portfolio.
     
-    # Load configuration
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
+    Args:
+        portfolio_values: List of portfolio values over time
+        initial_value: Initial portfolio value
+        
+    Returns:
+        Dictionary of performance metrics
+    """
+    # Calculate returns
+    returns = np.diff(portfolio_values) / portfolio_values[:-1]
     
-    # Determine output directory
-    if args.output_dir is None:
-        args.output_dir = os.path.dirname(os.path.dirname(args.model_path))
-        if not os.path.exists(args.output_dir):
-            args.output_dir = 'evaluation_results'
+    # Calculate metrics
+    total_return = (portfolio_values[-1] / portfolio_values[0]) - 1
+    num_days = len(portfolio_values)
+    annualized_return = (1 + total_return) ** (252 / num_days) - 1
     
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Calculate volatility
+    daily_volatility = np.std(returns)
+    annualized_volatility = daily_volatility * np.sqrt(252)
     
-    # Set device
-    device = args.device if args.device is not None else (
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
-    print(f"Using device: {device}")
+    # Calculate Sharpe ratio (assuming risk-free rate of 0)
+    sharpe_ratio = annualized_return / annualized_volatility if annualized_volatility > 0 else 0
     
-    # Load data
-    print("Loading data...")
-    data_loader = DataLoader(
-        data_dir='data',
-        market_name=config['training']['market']
-    )
+    # Calculate maximum drawdown
+    peak = portfolio_values[0]
+    drawdowns = []
+    for value in portfolio_values:
+        if value > peak:
+            peak = value
+        drawdown = (peak - value) / peak
+        drawdowns.append(drawdown)
+    max_drawdown = max(drawdowns)
     
-    data_dict = data_loader.load_data(
-        window_size=config['training']['window_size'],
-        relation_file=config['model']['relation_file']
-    )
+    # Calculate Sortino ratio (downside deviation)
+    negative_returns = returns[returns < 0]
+    downside_deviation = np.std(negative_returns) * np.sqrt(252) if len(negative_returns) > 0 else 0
+    sortino_ratio = annualized_return / downside_deviation if downside_deviation > 0 else 0
     
-    print(f"Loaded {data_dict['num_stocks']} stocks with {data_dict['num_days']} days of data")
+    # Calculate win rate
+    num_positive_days = np.sum(returns > 0)
+    win_rate = num_positive_days / len(returns) if len(returns) > 0 else 0
+    
+    # Return metrics dictionary
+    return {
+        'total_return': total_return,
+        'annualized_return': annualized_return,
+        'annualized_volatility': annualized_volatility,
+        'sharpe_ratio': sharpe_ratio,
+        'max_drawdown': max_drawdown,
+        'sortino_ratio': sortino_ratio,
+        'win_rate': win_rate,
+        'num_days': num_days
+    }
+
+
+def evaluate_model(
+    data_dict,
+    model_path,
+    config,
+    output_dir,
+    device="cpu"
+):
+    """
+    Evaluate the portfolio manager model on test data.
+    
+    Args:
+        data_dict: Dictionary containing data
+        model_path: Path to model weights
+        config: Configuration dictionary
+        output_dir: Output directory
+        device: Device to use for evaluation
+        
+    Returns:
+        Performance metrics and portfolio history
+    """
+    # Extract parameters from config
+    model_config = config['model']
+    backtest_config = config['backtest']
+    
+    # Extract test indices
+    test_indices = data_dict['test_indices']
     
     # Create environment
     env = TradingEnvironment(
         stock_data=data_dict['stock_data'],
-        market_data=data_dict['market_data'],
-        returns_data=data_dict['returns_data'],
-        window_size=config['training']['window_size'],
-        num_assets_select=config['model']['portfolio']['num_assets_select'],
-        reward_type=config['environment']['reward_type'],
-        transaction_fee=config['environment']['transaction_fee'],
-        initial_balance=config['environment']['initial_balance']
+        window_size=model_config['window_size'],
+        initial_balance=backtest_config['initial_balance'],
+        transaction_fee=backtest_config['transaction_fee'],
+        holding_period=backtest_config.get('holding_period', 5),
+        reward_type="return",
+        num_assets_select=model_config['num_assets_select'],
+        use_randomized_starts=False  # We want deterministic start for evaluation
     )
     
-    # Create agent
-    agent = DeepTraderAgent(
+    # Create model
+    manager = PortfolioManager(
         stock_feature_dim=data_dict['stock_features'],
-        market_feature_dim=data_dict['market_features'],
         num_assets=data_dict['num_stocks'],
-        window_size=config['training']['window_size'],
-        hidden_dim=config['model']['asu']['hidden_dim'],
-        use_market_unit=config['model']['use_market_unit'],
-        use_spatial_attention=config['model']['use_spatial_attention'],
-        use_gcn=config['model']['use_gcn'],
-        relation_matrix=data_dict['relation_matrix'],
-        use_adaptive_adj=config['model']['use_adaptive_adj'],
-        num_assets_select=config['model']['portfolio']['num_assets_select'],
-        learning_rate=config['training']['learning_rate'],
-        gamma=config['training']['gamma'],
-        batch_size=config['training']['batch_size'],
+        window_size=model_config['window_size'],
+        hidden_dim=model_config['hidden_dim'],
+        use_spatial_attention=model_config['use_spatial_attention'],
+        use_gcn=model_config['use_gcn'],
+        use_adaptive_adj=model_config.get('use_adaptive_adj', True),
+        num_assets_select=model_config['num_assets_select'],
         device=device
     )
     
     # Load model weights
-    print(f"Loading model from {args.model_path}")
-    agent.load(args.model_path)
+    print(f"Loading model from {model_path}")
+    manager.load(model_path)
     
-    # Choose data split to evaluate on
-    if args.data_split == 'train':
-        evaluation_indices = data_dict['train_indices']
-        split_name = 'Training'
-    elif args.data_split == 'val':
-        evaluation_indices = data_dict['val_indices']
-        split_name = 'Validation'
-    else:  # test
-        evaluation_indices = data_dict['test_indices']
-        split_name = 'Test'
+    # Set model to evaluation mode
+    manager.asu.eval()
     
-    print(f"Evaluating on {split_name} set with {len(evaluation_indices)} samples...")
+    # Run evaluation on each test episode
+    all_portfolio_values = []
+    all_portfolio_returns = []
+    all_portfolio_weights = []
+    all_asset_scores = []
     
-    # Evaluate model
-    portfolio_values = []
-    portfolio_weights_history = []
-    daily_returns = []
-    action_history = []
+    # Sort test indices for chronological evaluation
+    test_indices.sort()
     
-    initial_balance = config['environment']['initial_balance']
+    # Set start index to the earliest test index
+    start_idx = test_indices[0]
+    state = env.reset_to_index(start_idx)
     
-    # Run evaluation
-    for idx in tqdm(evaluation_indices, desc=f"Evaluating on {split_name} set"):
-        # Reset environment to current index
-        env.current_step = idx - config['training']['window_size']
-        env.portfolio_value = initial_balance
-        env.portfolio_weights = np.zeros(data_dict['num_stocks'])
-        env.portfolio_history = [env.portfolio_value]
-        obs = env._get_observation()
+    done = False
+    step = 0
+    
+    # Initialize tracking variables
+    portfolio_values = [env.portfolio_value]
+    portfolio_returns = []
+    portfolio_weights = []
+    asset_scores = []
+    
+    print(f"Starting evaluation from index {start_idx}...")
+    
+    # Run until done
+    while not done:
+        # Get asset scores from portfolio manager
+        with torch.no_grad():
+            scores = manager.predict_scores(state)
         
-        # Select action (no exploration)
-        action = agent.select_action(obs, epsilon=0.0)
-        action_history.append(action)
-        
-        # Take step
-        next_obs, reward, done, info = env.step(action)
+        # Take step in environment
+        next_state, reward, done, info = env.step(scores)
         
         # Track performance
-        portfolio_values.append(info['portfolio_value'])
-        portfolio_weights_history.append(env.portfolio_weights.copy())
+        portfolio_values.append(env.portfolio_value)
+        portfolio_returns.append(info['portfolio_return'])
+        portfolio_weights.append(env.portfolio_weights.copy())
+        asset_scores.append(scores)
         
-        # Calculate daily return
-        if len(portfolio_values) > 1:
-            daily_return = (portfolio_values[-1] / portfolio_values[-2]) - 1
-            daily_returns.append(daily_return)
+        # Update state
+        state = next_state
         
-        obs = next_obs
-    
-    # Convert to numpy arrays
-    portfolio_values = np.array(portfolio_values)
-    portfolio_weights_history = np.array(portfolio_weights_history)
-    daily_returns = np.array(daily_returns) if daily_returns else np.array([])
-    
-    # Create benchmark (equal weight portfolio)
-    benchmark_weights = np.zeros(data_dict['num_stocks'])
-    long_indices = np.arange(config['model']['portfolio']['num_assets_select'])
-    short_indices = np.arange(config['model']['portfolio']['num_assets_select'])
-    benchmark_weights[long_indices] = 1.0 / config['model']['portfolio']['num_assets_select']
-    benchmark_weights[short_indices] = -1.0 / config['model']['portfolio']['num_assets_select']
-    
-    benchmark_portfolio_values = [initial_balance]
-    for idx in evaluation_indices:
-        returns = data_dict['returns_data'][:, idx]
-        portfolio_return = np.sum(benchmark_weights * returns)
-        benchmark_portfolio_values.append(benchmark_portfolio_values[-1] * (1 + portfolio_return))
-    
-    benchmark_portfolio_values = np.array(benchmark_portfolio_values[1:])  # Skip initial value
-    
-    # Calculate and print performance metrics
-    print(f"\n{split_name} Set Performance:")
-    print_performance_report(portfolio_values, benchmark_portfolio_values)
-    
-    # Save results
-    results = evaluate_portfolio(portfolio_values)
-    benchmark_results = evaluate_portfolio(benchmark_portfolio_values)
-    
-    results_dict = {
-        'model_performance': {
-            'total_return': float(results['total_return']),
-            'annualized_return': float(results['annualized_return']),
-            'sharpe_ratio': float(results['sharpe_ratio']),
-            'sortino_ratio': float(results['sortino_ratio']),
-            'max_drawdown': float(results['max_drawdown']),
-            'calmar_ratio': float(results['calmar_ratio'])
-        },
-        'benchmark_performance': {
-            'total_return': float(benchmark_results['total_return']),
-            'annualized_return': float(benchmark_results['annualized_return']),
-            'sharpe_ratio': float(benchmark_results['sharpe_ratio']),
-            'sortino_ratio': float(benchmark_results['sortino_ratio']),
-            'max_drawdown': float(benchmark_results['max_drawdown']),
-            'calmar_ratio': float(benchmark_results['calmar_ratio'])
-        },
-        'comparison': {
-            'return_difference': float(results['total_return'] - benchmark_results['total_return']),
-            'sharpe_difference': float(results['sharpe_ratio'] - benchmark_results['sharpe_ratio'])
-        }
-    }
-    
-    # Save results to file
-    results_path = os.path.join(args.output_dir, f"{args.data_split}_results.yaml")
-    with open(results_path, 'w') as f:
-        yaml.dump(results_dict, f)
-    
-    print(f"Results saved to {results_path}")
-    
-    # Save portfolio weights if requested
-    if args.save_weights:
-        weights_path = os.path.join(args.output_dir, f"{args.data_split}_weights.npy")
-        np.save(weights_path, portfolio_weights_history)
-        print(f"Portfolio weights saved to {weights_path}")
-    
-    # Generate plots
-    # Performance plot
-    plt.figure(figsize=(12, 8))
-    plt.plot(portfolio_values, label="DeepTrader", linewidth=2)
-    plt.plot(benchmark_portfolio_values, label="Benchmark", linewidth=2, alpha=0.7)
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.title(f"{split_name} Set Performance")
-    plt.xlabel("Trading Days")
-    plt.ylabel("Portfolio Value")
-    
-    # Save performance plot
-    plot_path = os.path.join(args.output_dir, f"{args.data_split}_performance.png")
-    plt.savefig(plot_path)
-    if args.plot:
-        plt.show()
-    plt.close()
-    
-    # Drawdown plot
-    peak = np.maximum.accumulate(portfolio_values)
-    drawdown = (portfolio_values - peak) / peak
-    
-    plt.figure(figsize=(12, 8))
-    plt.plot(drawdown, color='red', linewidth=2)
-    plt.fill_between(range(len(drawdown)), drawdown, 0, color='red', alpha=0.3)
-    plt.grid(True, alpha=0.3)
-    plt.title(f"{split_name} Set Drawdowns")
-    plt.xlabel("Trading Days")
-    plt.ylabel("Drawdown")
-    
-    # Add maximum drawdown to the plot
-    max_dd = np.min(drawdown)
-    max_dd_idx = np.argmin(drawdown)
-    plt.axhline(y=max_dd, color='black', linestyle='--', alpha=0.5)
-    plt.text(max_dd_idx, max_dd, f" Max Drawdown: {max_dd:.2%}", verticalalignment='bottom')
-    
-    # Save drawdown plot
-    drawdown_path = os.path.join(args.output_dir, f"{args.data_split}_drawdowns.png")
-    plt.savefig(drawdown_path)
-    if args.plot:
-        plt.show()
-    plt.close()
-    
-    # Generate daily returns distribution plot
-    if len(daily_returns) > 0:
-        plt.figure(figsize=(12, 8))
-        plt.hist(daily_returns, bins=50, alpha=0.75)
-        plt.axvline(x=0, color='red', linestyle='--')
-        plt.axvline(x=np.mean(daily_returns), color='green', linestyle='-', label=f"Mean: {np.mean(daily_returns):.4f}")
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.title(f"{split_name} Set Daily Returns Distribution")
-        plt.xlabel("Daily Return")
-        plt.ylabel("Frequency")
+        # Print progress
+        if step % 10 == 0:
+            print(f"Step {step}: Portfolio Value = ${env.portfolio_value:.2f}")
         
-        # Save returns distribution plot
-        returns_path = os.path.join(args.output_dir, f"{args.data_split}_returns_dist.png")
-        plt.savefig(returns_path)
-        if args.plot:
-            plt.show()
-        plt.close()
+        step += 1
     
-    print(f"Plots saved to {args.output_dir}")
-    print("Evaluation completed!")
+    # Calculate performance metrics
+    metrics = evaluate_portfolio_performance(
+        portfolio_values, 
+        initial_value=backtest_config['initial_balance']
+    )
+    
+    # Print performance summary
+    print("\nPerformance Summary:")
+    print(f"Total Return: {metrics['total_return']:.2%}")
+    print(f"Annualized Return: {metrics['annualized_return']:.2%}")
+    print(f"Annualized Volatility: {metrics['annualized_volatility']:.2%}")
+    print(f"Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
+    print(f"Maximum Drawdown: {metrics['max_drawdown']:.2%}")
+    print(f"Sortino Ratio: {metrics['sortino_ratio']:.2f}")
+    print(f"Win Rate: {metrics['win_rate']:.2%}")
+    print(f"Number of Trading Days: {metrics['num_days']}")
+    
+    # Create DataFrame with results
+    results = pd.DataFrame({
+        'portfolio_value': portfolio_values,
+        'return': [0] + portfolio_returns,  # Add 0 for initial return
+    })
+    
+    # Add portfolio weights
+    weights_df = pd.DataFrame(
+        portfolio_weights, 
+        columns=[f'weight_{ticker}' for ticker in data_dict['tickers']]
+    )
+    
+    # Prepend an initial row of zeros for weights (initial state)
+    initial_weights = pd.DataFrame(
+        [np.zeros(data_dict['num_stocks'])], 
+        columns=weights_df.columns
+    )
+    weights_df = pd.concat([initial_weights, weights_df])
+    
+    # Combine results
+    results = pd.concat([results, weights_df], axis=1)
+    
+    # Plot results
+    plt.figure(figsize=(15, 10))
+    
+    # Portfolio value
+    plt.subplot(3, 1, 1)
+    plt.plot(portfolio_values)
+    plt.title('Portfolio Value')
+    plt.xlabel('Trading Days')
+    plt.ylabel('Value ($)')
+    plt.grid(True)
+    
+    # Portfolio returns
+    plt.subplot(3, 1, 2)
+    plt.plot(portfolio_returns)
+    plt.title('Portfolio Returns')
+    plt.xlabel('Trading Days')
+    plt.ylabel('Return (%)')
+    plt.grid(True)
+    
+    # Asset weights over time (stacked area chart for top assets)
+    plt.subplot(3, 1, 3)
+    
+    # Get top N assets by average weight
+    top_n = min(10, data_dict['num_stocks'])
+    avg_weights = np.mean(portfolio_weights, axis=0)
+    top_indices = np.argsort(-avg_weights)[:top_n]
+    
+    # Extract weights for top assets
+    top_weights = np.array(portfolio_weights)[:, top_indices]
+    
+    # Create labels for top assets
+    top_tickers = [data_dict['tickers'][i] for i in top_indices]
+    
+    # Plot stacked area chart
+    plt.stackplot(
+        range(len(portfolio_weights)),
+        top_weights.T,
+        labels=top_tickers,
+        alpha=0.7
+    )
+    plt.title('Portfolio Composition (Top Assets)')
+    plt.xlabel('Trading Days')
+    plt.ylabel('Weight')
+    plt.legend(loc='upper left', fontsize='small')
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'evaluation_results.png'))
+    
+    # Save detailed results to CSV
+    results.to_csv(os.path.join(output_dir, 'detailed_results.csv'), index=False)
+    
+    # Save metrics to JSON
+    with open(os.path.join(output_dir, 'metrics.json'), 'w') as f:
+        json.dump({k: float(v) for k, v in metrics.items()}, f, indent=4)
+    
+    return metrics, results
+
+
+def main():
+    """Main function."""
+    args = parse_args()
+    
+    # Set random seed
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    
+    # Load configuration
+    with open(args.config, 'r') as f:
+        config = json.load(f)
+    
+    # Set device
+    device = args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Create output directory
+    if args.output_dir:
+        output_dir = args.output_dir
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = f"outputs/evaluation_{timestamp}"
+    
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Output directory: {output_dir}")
+    
+    # Save config to output directory
+    with open(os.path.join(output_dir, 'config.json'), 'w') as f:
+        json.dump(config, f, indent=4)
+    
+    # Load data
+    data_loader = DataLoader(data_dir=args.data_dir)
+    data_dict = data_loader.load_data(window_size=config['model']['window_size'])
+    
+    # Evaluate model
+    metrics, results = evaluate_model(
+        data_dict=data_dict,
+        model_path=args.model_path,
+        config=config,
+        output_dir=output_dir,
+        device=device
+    )
+    
+    print(f"Evaluation completed. Results saved to {output_dir}")
 
 
 if __name__ == "__main__":

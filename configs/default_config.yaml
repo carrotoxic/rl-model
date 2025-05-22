@@ -1,41 +1,32 @@
 # Training parameters
 training:
-  market: "DJIA"  # Market name
-  window_size: 13  # Input window size (weeks)
-  batch_size: 32
-  learning_rate: 0.0001
-  gamma: 0.99  # Discount factor
-  epochs: 100
-  save_interval: 10
-  tensorboard_log: true
-  random_seed: 42
+  batch_size: 100
+  learning_rate: 0.01
+  weight_decay: 0.001
+  num_epochs: 100
+  episodes_per_epoch: 10
+  train_split: 0.8
+  validation_split: 0.1
+  test_split: 0.1
 
 # Model parameters
 model:
-  use_market_unit: true  # Whether to use market scoring unit
-  use_spatial_attention: true  # Whether to use spatial attention in asset unit
-  use_gcn: true  # Whether to use graph convolutional network
-  use_adaptive_adj: true  # Whether to use adaptive adjacency matrix
-  relation_file: "relation_matrix.npy"  # Relationship matrix for GCN
-  
-  # Asset scoring unit (ASU)
-  asu:
-    hidden_dim: 64
-    num_layers: 2
-    dropout: 0.1
-    
-  # Market scoring unit (MSU)
-  msu:
-    hidden_dim: 64
-    num_layers: 2
-    dropout: 0.1
-    
-  # Portfolio allocation
-  portfolio:
-    num_assets_select: 4  # Number of assets to select for long/short positions
+  window_size: 65  # 13 weeks
+  hidden_dim: 64
+  use_spatial_attention: true
+  use_gcn: true
+  use_adaptive_adj: true
+  num_assets_select: 4
+  relation_file: "relation_matrix.npy"
+
+# Backtest parameters
+backtest:
+  initial_balance: 10000
+  transaction_fee: 0.001
+  holding_period: 25  # 5 weeks
 
 # Environment parameters
 environment:
   initial_balance: 10000
   transaction_fee: 0.001
-  reward_type: "sharpe"  # Options: "sharpe", "sortino", "max_drawdown", "return" 
+  reward_type: "return"  # Options: "sharpe", "sortino", "max_drawdown", "return" 
